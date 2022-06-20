@@ -1,21 +1,14 @@
-use axum::{
-    extract::Extension,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
-};
+use axum::{extract::Extension, http::StatusCode, routing::post, Json, Router};
 use serde::Deserialize;
 use std::{collections::HashMap, net::SocketAddr};
 use std::{
     sync::{mpsc, Arc, RwLock},
     thread, time,
 };
-use tokio::{join, runtime::Handle};
+use tokio::runtime::Handle;
+
 use youtubei_rs::{
-    query::browse_id,
-    types::{client::ClientConfig, misc::TabRendererContent},
-    utils::default_client_config,
+    query::browse_id, types::misc::TabRendererContent, utils::default_client_config,
 };
 
 #[tokio::main]
@@ -83,12 +76,15 @@ fn executer_thread(
     loop {
         let mut lock = state.write().unwrap();
         match lock.current_channel_stack.pop() {
-            Some(v) => Some(
-                handle
-                    .read()
-                    .unwrap()
-                    .spawn(async move { println!("{}",query_channel(v.clone()).await) }),
-            ),
+            Some(cid) => {
+                let s = state.clone();
+                Some(handle.read().unwrap().spawn(async move {
+                    let vid = query_channel(cid.clone()).await;
+                    if !vid.is_empty() {
+                        s.write().unwrap().channels_video_ids.insert(cid, vid);
+                    }
+                }))
+            }
             None => None,
         };
         drop(lock); // Drop the lock to unlock the state
