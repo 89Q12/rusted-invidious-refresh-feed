@@ -65,7 +65,7 @@ fn fill_stack(state: Arc<RwLock<State>>) {
             .for_each(|id| lock.current_channel_stack.push(id.to_owned()));
         drop(lock);
         println!("Waiting for 60 seconds...");
-        thread::sleep(time::Duration::from_secs(60));
+        thread::sleep(time::Duration::from_secs(10));
     }
 }
 fn executer_thread(
@@ -80,9 +80,12 @@ fn executer_thread(
                 let s = state.clone();
                 Some(handle.read().unwrap().spawn(async move {
                     let vid = query_channel(cid.clone()).await;
-                    if !vid.is_empty() {
-                        s.write().unwrap().channels_video_ids.insert(cid, vid);
+                    if !vid.is_empty() && s.read().unwrap().channels_video_ids.get(&cid).unwrap() != &vid {
+                        println!("New video {}", vid);
+                        s.write().unwrap().channels_video_ids.insert(cid.clone(), vid);
+                        return;
                     }
+                    println!("No new video");
                 }))
             }
             None => None,
@@ -106,21 +109,30 @@ async fn query_channel(channel_id: String) -> String {
     let browse_data = browse_id(channel_id, "".to_string(), &default_client_config()).await;
     match browse_data {
         Ok(data) => match data.contents.unwrap().two_column_browse_results_renderer.unwrap().tabs.get(0).unwrap().tab_renderer.as_ref().unwrap().content.as_ref().unwrap(){
-            TabRendererContent::SectionListRenderer(content) => match content.contents.get(2).unwrap(){
-                youtubei_rs::types::misc::ItemSectionRendererContents::ItemSectionRenderer(content) => match content.contents.get(0).unwrap(){
-                        youtubei_rs::types::misc::ItemSectionRendererContents::ShelfRenderer(renderer) => match renderer.content.horizontal_list_renderer.as_ref().unwrap().items.get(0).unwrap(){
-                            youtubei_rs::types::misc::ItemSectionRendererContents::GridVideoRenderer(video) => video.video_id.clone(),
-                            _ => unreachable!()
-                        }
-                        _ => unreachable!()
-                },
-                _ => unreachable!(),
-
-            },
+            TabRendererContent::SectionListRenderer(content) => for item in content.contents.iter(){
+                match item{
+                    youtubei_rs::types::misc::ItemSectionRendererContents::ItemSectionRenderer(item) => for item in item.contents.iter() {
+                        match item {
+                            youtubei_rs::types::misc::ItemSectionRendererContents::ShelfRenderer(shelf) => 
+                            if shelf.title.runs.as_ref().unwrap().get(0).unwrap().text == "Uploads" {
+                                    match shelf.content.horizontal_list_renderer.as_ref().unwrap().items.get(0).unwrap() {
+                                        youtubei_rs::types::misc::ItemSectionRendererContents::GridVideoRenderer(vid) => return vid.video_id.clone(),
+                                        _ => return String::from(""),
+                                    };
+                            }else{
+                                    continue;
+                            },
+                            _ => continue,
+                        };
+                    },
+                    _ => unreachable!(),
+                };
+            }
             _ => unreachable!()
         },
         Err(_) => return String::from(""),
-    }
+    };
+    return String::from("")
 }
 
 async fn add_channel(
@@ -128,7 +140,8 @@ async fn add_channel(
     Extension(state): Extension<Arc<RwLock<State>>>,
 ) -> StatusCode {
     println!("added {}", payload.id);
-    state.write().unwrap().channels_to_refresh.push(payload.id);
+    state.write().unwrap().channels_to_refresh.push(payload.id.clone());
+    state.write().unwrap().channels_video_ids.insert(payload.id, payload.newest_video_id);
     StatusCode::CREATED
 }
 
@@ -150,6 +163,7 @@ async fn remove_channel(
 #[derive(Deserialize)]
 struct Channel {
     id: String,
+    newest_video_id: String,
 }
 
 struct State {
