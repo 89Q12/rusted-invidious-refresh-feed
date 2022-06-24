@@ -1,5 +1,11 @@
 use axum::{extract::Extension, http::StatusCode, routing::post, Json, Router};
+use rdkafka::{ClientConfig, producer};
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::Deserialize;
+use tokio::join;
+use youtubei_rs::query::{next_video_id, player};
+use youtubei_rs::types::error::RequestError;
+use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
 use std::{
     sync::{mpsc, Arc, RwLock},
@@ -13,6 +19,10 @@ use youtubei_rs::{
 
 #[tokio::main]
 async fn main() {
+    let producer: FutureProducer =ClientConfig::new()
+    .set("bootstrap.servers", "localhost:9092")
+    .set("message.timeout.ms", "5000")
+    .create::<FutureProducer>().unwrap();
     // initialize tracing
     tracing_subscriber::fmt::init();
     let tk_rt_handle: Arc<RwLock<Handle>> = Arc::new(RwLock::new(Handle::current()));
@@ -31,7 +41,7 @@ async fn main() {
     let handle_exec = {
         let state = state.clone();
         thread::spawn(move || {
-            executer_thread(state, tk_rt_handle, receiver);
+            executer_thread(state, tk_rt_handle, receiver,Arc::new(producer));
         })
     };
     let app = Router::new()
@@ -72,17 +82,24 @@ fn executer_thread(
     state: Arc<RwLock<State>>,
     handle: Arc<RwLock<Handle>>,
     rx: mpsc::Receiver<String>,
+    kafka_producer: Arc<FutureProducer>
 ) {
     loop {
         let mut lock = state.write().unwrap();
         match lock.current_channel_stack.pop() {
             Some(cid) => {
                 let s = state.clone();
+                let kafka_producer = kafka_producer.clone();
                 Some(handle.read().unwrap().spawn(async move {
                     let vid = query_channel(cid.clone()).await;
                     if !vid.is_empty() && s.read().unwrap().channels_video_ids.get(&cid).unwrap() != &vid {
                         println!("New video {}", vid);
-                        s.write().unwrap().channels_video_ids.insert(cid.clone(), vid);
+                        s.write().unwrap().channels_video_ids.insert(cid.clone(), vid.clone());
+                        //Database::fetch_and_insert(vid.clone(), cid.clone()).await;
+                        // TODO: Notify the notification manager about the new video
+                        kafka_producer.send(FutureRecord::to("video_feed")
+                        .payload(&format!(r#"{{"channel_id"={}, "video_id={} }}"#, &cid, &vid))
+                        .key(""), Duration::from_secs(0)).await.unwrap();
                         return;
                     }
                     println!("No new video");
@@ -171,4 +188,17 @@ struct State {
     channels_video_ids: HashMap<String, String>,
     channels_to_refresh: Vec<String>,
     current_channel_stack: Vec<String>,
+}
+
+struct Database{
+
+}
+impl Database {
+    async fn fetch_and_insert(video_id:String,channel_id: String){
+        let client = default_client_config();
+        let next = next_video_id(video_id.clone(), "".to_string(), &client);
+        let player = player(video_id.clone(), "".to_string(), &client);
+        let (vid_next, vid_player) = join!(next,player);
+        println!("{}",vid_player.unwrap().video_details.title);
+    }
 }
