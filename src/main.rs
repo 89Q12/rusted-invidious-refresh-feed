@@ -1,16 +1,13 @@
 use axum::{extract::Extension, http::StatusCode, routing::post, Json, Router};
 use chrono::Duration;
-use rdkafka::ClientConfig;
+use quick_xml::events::Event;
+use quick_xml::Reader;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::ClientConfig;
+use scylla::prepared_statement::PreparedStatement;
 use scylla::transport::errors::NewSessionError;
 use scylla::{Session, SessionBuilder};
-use scylla::prepared_statement::PreparedStatement;
 use serde::Deserialize;
-use tokio::join;
-use tracing::Level;
-use tracing_subscriber::registry::Data;
-use youtubei_rs::query::{next_video_id, player};
-use youtubei_rs::types::query_results::NextResult;
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,18 +16,22 @@ use std::{
     sync::{mpsc, Arc, RwLock},
     thread, time,
 };
+use tokio::join;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
-use quick_xml::Reader;
-use quick_xml::events::Event;
-use youtubei_rs::{utils::default_client_config, types::client::ClientConfig as YTClientConfig};
+use tracing::Level;
+use tracing_subscriber::registry::Data;
+use youtubei_rs::query::{next_video_id, player};
+use youtubei_rs::types::query_results::NextResult;
+use youtubei_rs::{types::client::ClientConfig as YTClientConfig, utils::default_client_config};
 
 #[tokio::main]
 async fn main() {
-    let producer: FutureProducer =ClientConfig::new()
-    .set("bootstrap.servers", "localhost:9092")
-    .set("message.timeout.ms", "5000")
-    .create::<FutureProducer>().unwrap();
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", "localhost:9092")
+        .set("message.timeout.ms", "5000")
+        .create::<FutureProducer>()
+        .unwrap();
     // initialize tracing
     tracing_subscriber::fmt::init();
     let tk_rt_handle: Arc<RwLock<Handle>> = Arc::new(RwLock::new(Handle::current()));
@@ -51,7 +52,14 @@ async fn main() {
     let handle_exec = {
         let state = syncstate.clone();
         thread::spawn(move || {
-            executer_thread(state, tk_rt_handle, receiver,Arc::new(producer), Arc::new(db),asyncstate);
+            executer_thread(
+                state,
+                tk_rt_handle,
+                receiver,
+                Arc::new(producer),
+                Arc::new(db),
+                asyncstate,
+            );
         })
     };
     let app = Router::new()
@@ -107,16 +115,22 @@ fn executer_thread(
                 let async_state = async_state.clone();
                 Some(handle.read().unwrap().spawn(async move {
                     let vid = query_channel(cid.clone(), async_state).await;
-                    if !vid.is_empty() && s.read().unwrap().channels_video_ids.get(&cid).unwrap() != &vid {
+                    if !vid.is_empty()
+                        && s.read().unwrap().channels_video_ids.get(&cid).unwrap() != &vid
+                    {
                         println!("New video {}", vid);
-                        s.write().unwrap().channels_video_ids.insert(cid.clone(), vid.clone());
-                        let dbcall= db_manager.fetch_and_insert(vid.clone(), cid.clone());
+                        s.write()
+                            .unwrap()
+                            .channels_video_ids
+                            .insert(cid.clone(), vid.clone());
+                        let dbcall = db_manager.fetch_and_insert(vid.clone(), cid.clone());
                         let payload = format!(r#"{{"channel_id"={}, "video_id={} }}"#, &cid, &vid);
                         // TODO: Notify the notification manager about the new video
-                        let kafkacall= kafka_producer.send(FutureRecord::to("video_feed")
-                        .payload(&payload)
-                        .key(""), std::time::Duration::from_secs(0));
-                        join!(kafkacall,dbcall).0.unwrap(); // TODO: Add tracing here to track errors
+                        let kafkacall = kafka_producer.send(
+                            FutureRecord::to("video_feed").payload(&payload).key(""),
+                            std::time::Duration::from_secs(0),
+                        );
+                        join!(kafkacall, dbcall).0.unwrap(); // TODO: Add tracing here to track errors
                         return;
                     }
                     println!("No new video: {}", vid);
@@ -140,19 +154,22 @@ fn executer_thread(
 }
 async fn query_channel(channel_id: String, async_state: Arc<Mutex<YTClientConfig>>) -> String {
     println!("updated {}", channel_id);
-    let uri = format!("https://www.youtube.com/feeds/videos.xml?channel_id={}", channel_id);
+    let uri = format!(
+        "https://www.youtube.com/feeds/videos.xml?channel_id={}",
+        channel_id
+    );
     let res = async_state.lock().await.http_client.get(uri).send().await;
     match res {
         Ok(res) => {
             extract_xml(&res.text().await.unwrap()).get(0).unwrap();
             // for now just take the first but should be changed to check if it contains current video_id if not return all ids or ids up to current video_id
-        },
+        }
         Err(e) => tracing::event!(target:"yt", Level::ERROR, "{}", e.to_string()),
     };
     todo!()
 }
 
-fn extract_xml(xml: &String) -> Vec<String>{
+fn extract_xml(xml: &String) -> Vec<String> {
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
     let mut buf = Vec::new();
@@ -160,8 +177,8 @@ fn extract_xml(xml: &String) -> Vec<String>{
     // The `Reader` does not implement `Iterator` because it outputs borrowed data (`Cow`s)
     loop {
         match reader.read_event(&mut buf) {
-        // for triggering namespaced events, use this instead:
-        // match reader.read_namespaced_event(&mut buf) {
+            // for triggering namespaced events, use this instead:
+            // match reader.read_namespaced_event(&mut buf) {
             // unescape and decode the text event using the reader encoding
             Ok(Event::Start(ref e)) if e.name().as_ref() == b"yt:videoId" => {
                 txt.push(
@@ -174,7 +191,7 @@ fn extract_xml(xml: &String) -> Vec<String>{
             Err(e) => panic!("Error at position {}: {:?}", reader.buffer_position(), e),
             _ => (), // There are several other `Event`s we do not consider here
         }
-    
+
         // if we don't keep a borrow elsewhere, we can clear the buffer to keep memory usage low
         buf.clear();
     }
@@ -182,10 +199,23 @@ fn extract_xml(xml: &String) -> Vec<String>{
 }
 
 fn get_video_from_shelf(shelf: &youtubei_rs::types::misc::ShelfRenderer) -> String {
-    println!("{}",shelf.title.runs.as_ref().unwrap().get(0).unwrap().text);
-    match shelf.content.horizontal_list_renderer.as_ref().unwrap().items.get(0).unwrap() {
-            youtubei_rs::types::misc::ItemSectionRendererContents::GridVideoRenderer(vid) => return vid.video_id.clone(),
-            _ => return String::from(""),
+    println!(
+        "{}",
+        shelf.title.runs.as_ref().unwrap().get(0).unwrap().text
+    );
+    match shelf
+        .content
+        .horizontal_list_renderer
+        .as_ref()
+        .unwrap()
+        .items
+        .get(0)
+        .unwrap()
+    {
+        youtubei_rs::types::misc::ItemSectionRendererContents::GridVideoRenderer(vid) => {
+            return vid.video_id.clone()
+        }
+        _ => return String::from(""),
     };
 }
 
@@ -194,8 +224,16 @@ async fn add_channel(
     Extension(state): Extension<Arc<RwLock<State>>>,
 ) -> StatusCode {
     println!("added {}", payload.channel_id);
-    state.write().unwrap().channels_to_refresh.push(payload.channel_id.clone());
-    state.write().unwrap().channels_video_ids.insert(payload.channel_id, payload.newest_video_id);
+    state
+        .write()
+        .unwrap()
+        .channels_to_refresh
+        .push(payload.channel_id.clone());
+    state
+        .write()
+        .unwrap()
+        .channels_video_ids
+        .insert(payload.channel_id, payload.newest_video_id);
     StatusCode::CREATED
 }
 
@@ -227,46 +265,58 @@ struct State {
     current_channel_stack: Vec<String>,
 }
 
-struct Database{
+struct Database {
     session: Session,
     prepared_statement: PreparedStatement,
 }
 impl Database {
     /// Initializes a new DbManager struct and creates the database session
-    async fn new(uri: &str, known_hosts: Option<Vec<String>>) -> Result<Self, NewSessionError>{
+    async fn new(uri: &str, known_hosts: Option<Vec<String>>) -> Result<Self, NewSessionError> {
         let session_builder;
-        if known_hosts.is_some(){
-            session_builder = SessionBuilder::new().known_node(uri).known_nodes(&known_hosts.unwrap());
-        }else{
+        if known_hosts.is_some() {
+            session_builder = SessionBuilder::new()
+                .known_node(uri)
+                .known_nodes(&known_hosts.unwrap());
+        } else {
             session_builder = SessionBuilder::new().known_node(uri);
         }
-        
+
         match session_builder.build().await {
             Ok(session) => {
-                match session.use_keyspace("rusted_invidious", false).await{
-                    Ok(_) => tracing::event!(target:"db", Level::DEBUG, "Successfully set keyspace"),
+                match session.use_keyspace("rusted_invidious", false).await {
+                    Ok(_) => {
+                        tracing::event!(target:"db", Level::DEBUG, "Successfully set keyspace")
+                    }
                     Err(_) => panic!("KESPACE NOT FOUND EXISTING...."),
                 }
                 let prepared_statement = session.prepare("INSERT INTO videos (video_id, updated_at, channel_id, title, likes, view_count,\
                     description, length_in_seconds, genere, genre_url, license, author_verified, subcriber_count, author_name, author_thumbnail_url, is_famliy_safe, publish_date, formats, storyboard_spec_url, continuation_related, continuation_comments ) \
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").await.unwrap();
-                Ok(Self { session, prepared_statement})
-            },
+                Ok(Self {
+                    session,
+                    prepared_statement,
+                })
+            }
             Err(err) => Err(err),
         }
     }
-    async fn fetch_and_insert(&self,video_id:String,channel_id: String){
+    async fn fetch_and_insert(&self, video_id: String, channel_id: String) {
         let client = default_client_config();
         let next = next_video_id(video_id.clone(), "".to_string(), &client);
         let player = player(video_id.clone(), "".to_string(), &client);
-        let (vid_next, vid_player) = join!(next,player);
+        let (vid_next, vid_player) = join!(next, player);
         let vid_next = vid_next.unwrap();
         let vid_player = vid_player.unwrap();
-        let video = Video{
+        let video = Video {
             video_id,
-            updated_at: Timestamp(Duration::seconds(SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap().as_secs().try_into().unwrap())),
+            updated_at: Timestamp(Duration::seconds(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    .try_into()
+                    .unwrap(),
+            )),
             channel_id,
             title: vid_player.video_details.title,
             likes: get_likes(&vid_next),
@@ -276,13 +326,19 @@ impl Database {
             genre: vid_player.microformat.player_microformat_renderer.category,
             genre_url: String::from(""),
             license: String::from(""),
-            author_verified:get_author_verified(&vid_next),
+            author_verified: get_author_verified(&vid_next),
             subcriber_count: get_subcribe_count(&vid_next),
             author_name: vid_player.video_details.author,
             author_thumbnail_url: get_owner_thumbnail(&vid_next),
-            is_famliy_safe:vid_player.microformat.player_microformat_renderer.is_family_safe,
-            publish_date: vid_player.microformat.player_microformat_renderer.publish_date,
-            formats:String::from(""),
+            is_famliy_safe: vid_player
+                .microformat
+                .player_microformat_renderer
+                .is_family_safe,
+            publish_date: vid_player
+                .microformat
+                .player_microformat_renderer
+                .publish_date,
+            formats: String::from(""),
             storyboard_spec_url: vid_player.storyboards.player_storyboard_spec_renderer.spec,
             continuation_comments: get_continuation_comments(&vid_next),
             continuation_related: get_continuation_related(&vid_next),
@@ -292,29 +348,26 @@ impl Database {
         if !res {
             panic!("Failed to insert video: {}", res);
         }
-
     }
-    pub async fn insert_video(&self, video: Video) -> bool{
-        match self.session.execute(&self.prepared_statement,
-        video ).await{
-            Ok(_) =>  true,
+    pub async fn insert_video(&self, video: Video) -> bool {
+        match self.session.execute(&self.prepared_statement, video).await {
+            Ok(_) => true,
             Err(e) => {
                 println!("Failed to insert video: {}", e);
                 false
-            },
+            }
         }
     }
 }
 
-
-use scylla::macros::{IntoUserType,FromUserType,FromRow};
 use scylla::cql_to_rust::FromCqlVal;
-use scylla::frame::value::{Timestamp, ValueList, SerializedResult, SerializedValues};
+use scylla::frame::value::{SerializedResult, SerializedValues, Timestamp, ValueList};
+use scylla::macros::{FromRow, FromUserType, IntoUserType};
 
 /// Temporary needs to be in serpart crate aka rusted-invidious-types
 /// Represents a video queried from the database
-#[derive(Debug,IntoUserType, FromUserType,FromRow)]
-pub struct Video{
+#[derive(Debug, IntoUserType, FromUserType, FromRow)]
+pub struct Video {
     pub video_id: String, // Primary Key -> partition key
     pub updated_at: Timestamp,
     pub channel_id: String,
@@ -332,7 +385,7 @@ pub struct Video{
     pub author_thumbnail_url: String,
     pub is_famliy_safe: bool,
     pub publish_date: String,
-    pub formats:String, // This string contains json that holds all formats for the video. Could be stored in own table I think
+    pub formats: String, // This string contains json that holds all formats for the video. Could be stored in own table I think
     pub storyboard_spec_url: String,
     pub continuation_comments: Option<String>,
     pub continuation_related: Option<String>,
@@ -365,73 +418,200 @@ impl ValueList for Video {
         Ok(Cow::Owned(result))
     }
 }
-fn get_likes(video: &NextResult) -> String{
-    match video.contents.as_ref().unwrap().two_column_watch_next_results.as_ref().unwrap().results.results.contents.get(0).unwrap() {
-        youtubei_rs::types::misc::NextContents::VideoPrimaryInfoRenderer(vpir) => match vpir.video_actions.menu_renderer.as_ref().unwrap().top_level_buttons.as_ref().unwrap().get(0).unwrap(){
+fn get_likes(video: &NextResult) -> String {
+    match video
+        .contents
+        .as_ref()
+        .unwrap()
+        .two_column_watch_next_results
+        .as_ref()
+        .unwrap()
+        .results
+        .results
+        .contents
+        .get(0)
+        .unwrap()
+    {
+        youtubei_rs::types::misc::NextContents::VideoPrimaryInfoRenderer(vpir) => match vpir
+            .video_actions
+            .menu_renderer
+            .as_ref()
+            .unwrap()
+            .top_level_buttons
+            .as_ref()
+            .unwrap()
+            .get(0)
+            .unwrap()
+        {
             youtubei_rs::types::misc::TopLevelButtons::ButtonRenderer(_) => unreachable!(),
-            youtubei_rs::types::misc::TopLevelButtons::ToggleButtonRenderer(btn) => btn.default_text.accessibility.as_ref().unwrap().accessibility_data.label.clone(),
+            youtubei_rs::types::misc::TopLevelButtons::ToggleButtonRenderer(btn) => btn
+                .default_text
+                .accessibility
+                .as_ref()
+                .unwrap()
+                .accessibility_data
+                .label
+                .clone(),
         },
-        _ => unreachable!()
+        _ => unreachable!(),
     }
 }
 
-fn get_description(video: &NextResult) -> String{
+fn get_description(video: &NextResult) -> String {
     let mut desc = String::from("");
-    match video.contents.as_ref().unwrap().two_column_watch_next_results.as_ref().unwrap().results.results.contents.get(1).unwrap() {
-        youtubei_rs::types::misc::NextContents::VideoSecondaryInfoRenderer(vsir) => 
-        for text in vsir.description.runs.iter(){
-            desc.push_str(text.text.clone().as_str());
-        },
-        _ => unreachable!()
+    match video
+        .contents
+        .as_ref()
+        .unwrap()
+        .two_column_watch_next_results
+        .as_ref()
+        .unwrap()
+        .results
+        .results
+        .contents
+        .get(1)
+        .unwrap()
+    {
+        youtubei_rs::types::misc::NextContents::VideoSecondaryInfoRenderer(vsir) => {
+            for text in vsir.description.runs.iter() {
+                desc.push_str(text.text.clone().as_str());
+            }
+        }
+        _ => unreachable!(),
     }
     desc
 }
 
-fn get_author_verified(video: &NextResult) -> bool{
-    match video.contents.as_ref().unwrap().two_column_watch_next_results.as_ref().unwrap().results.results.contents.get(1).unwrap() {
-        youtubei_rs::types::misc::NextContents::VideoSecondaryInfoRenderer(vsir) => match &vsir.owner.video_owner_renderer.badges{
-            Some(badges) => match badges.get(0).unwrap().metadata_badge_renderer.icon.as_ref().unwrap().icon_type.as_str(){
-                "OFFICIAL_ARTIST_BADGE" => true,
-                "CHECK_CIRCLE_THICK"  => true,
-                _ => false
-            },
-            None => false,
-        },
-        _ => unreachable!()
+fn get_author_verified(video: &NextResult) -> bool {
+    match video
+        .contents
+        .as_ref()
+        .unwrap()
+        .two_column_watch_next_results
+        .as_ref()
+        .unwrap()
+        .results
+        .results
+        .contents
+        .get(1)
+        .unwrap()
+    {
+        youtubei_rs::types::misc::NextContents::VideoSecondaryInfoRenderer(vsir) => {
+            match &vsir.owner.video_owner_renderer.badges {
+                Some(badges) => match badges
+                    .get(0)
+                    .unwrap()
+                    .metadata_badge_renderer
+                    .icon
+                    .as_ref()
+                    .unwrap()
+                    .icon_type
+                    .as_str()
+                {
+                    "OFFICIAL_ARTIST_BADGE" => true,
+                    "CHECK_CIRCLE_THICK" => true,
+                    _ => false,
+                },
+                None => false,
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
-fn get_subcribe_count(video: &NextResult) -> String{
-    match video.contents.as_ref().unwrap().two_column_watch_next_results.as_ref().unwrap().results.results.contents.get(1).unwrap() {
-        youtubei_rs::types::misc::NextContents::VideoSecondaryInfoRenderer(vsir) => match &vsir.owner.video_owner_renderer.subscriber_count_text{
-            Some(text) => text.simple_text.clone(),
-            None => String::from(""),
-        },
-        _ => unreachable!()
+fn get_subcribe_count(video: &NextResult) -> String {
+    match video
+        .contents
+        .as_ref()
+        .unwrap()
+        .two_column_watch_next_results
+        .as_ref()
+        .unwrap()
+        .results
+        .results
+        .contents
+        .get(1)
+        .unwrap()
+    {
+        youtubei_rs::types::misc::NextContents::VideoSecondaryInfoRenderer(vsir) => {
+            match &vsir.owner.video_owner_renderer.subscriber_count_text {
+                Some(text) => text.simple_text.clone(),
+                None => String::from(""),
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
-fn get_owner_thumbnail(video: &NextResult) -> String{
-    match video.contents.as_ref().unwrap().two_column_watch_next_results.as_ref().unwrap().results.results.contents.get(1).unwrap() {
-        youtubei_rs::types::misc::NextContents::VideoSecondaryInfoRenderer(vsir) => vsir.owner.video_owner_renderer.thumbnail.thumbnails.get(0).unwrap().url.clone(),
-        _ => unreachable!()
+fn get_owner_thumbnail(video: &NextResult) -> String {
+    match video
+        .contents
+        .as_ref()
+        .unwrap()
+        .two_column_watch_next_results
+        .as_ref()
+        .unwrap()
+        .results
+        .results
+        .contents
+        .get(1)
+        .unwrap()
+    {
+        youtubei_rs::types::misc::NextContents::VideoSecondaryInfoRenderer(vsir) => vsir
+            .owner
+            .video_owner_renderer
+            .thumbnail
+            .thumbnails
+            .get(0)
+            .unwrap()
+            .url
+            .clone(),
+        _ => unreachable!(),
     }
 }
-fn get_continuation_comments(video: &NextResult) -> Option<String>{
-    match video.contents.as_ref().unwrap().two_column_watch_next_results.as_ref().unwrap().results.results.contents.last().unwrap() {
-        youtubei_rs::types::misc::NextContents::ContinuationItemRenderer(cir) => match &cir.continuation_endpoint.continuation_command{
-            Some(cmd) => Some(cmd.token.clone()),
-            None => None,
-        },
-        _ => None
+fn get_continuation_comments(video: &NextResult) -> Option<String> {
+    match video
+        .contents
+        .as_ref()
+        .unwrap()
+        .two_column_watch_next_results
+        .as_ref()
+        .unwrap()
+        .results
+        .results
+        .contents
+        .last()
+        .unwrap()
+    {
+        youtubei_rs::types::misc::NextContents::ContinuationItemRenderer(cir) => {
+            match &cir.continuation_endpoint.continuation_command {
+                Some(cmd) => Some(cmd.token.clone()),
+                None => None,
+            }
+        }
+        _ => None,
     }
 }
-fn get_continuation_related(video: &NextResult) -> Option<String>{
-    match video.contents.as_ref().unwrap().two_column_watch_next_results.as_ref().unwrap().results.results.contents.last().unwrap()  {
-        youtubei_rs::types::misc::NextContents::ContinuationItemRenderer(cir) => match &cir.continuation_endpoint.continuation_command{
-            Some(cmd) => Some(cmd.token.clone()),
-            None => None,
-        },
-        _ =>None
+fn get_continuation_related(video: &NextResult) -> Option<String> {
+    match video
+        .contents
+        .as_ref()
+        .unwrap()
+        .two_column_watch_next_results
+        .as_ref()
+        .unwrap()
+        .results
+        .results
+        .contents
+        .last()
+        .unwrap()
+    {
+        youtubei_rs::types::misc::NextContents::ContinuationItemRenderer(cir) => {
+            match &cir.continuation_endpoint.continuation_command {
+                Some(cmd) => Some(cmd.token.clone()),
+                None => None,
+            }
+        }
+        _ => None,
     }
 }
