@@ -114,7 +114,7 @@ fn executer_thread(
                         let kafkacall= kafka_producer.send(FutureRecord::to("video_feed")
                         .payload(&payload)
                         .key(""), std::time::Duration::from_secs(0));
-                        join!(kafkacall,dbcall).0.unwrap();
+                        join!(kafkacall,dbcall).0.unwrap(); // TODO: Add tracing here to track errors
                         return;
                     }
                     println!("No new video: {}", vid);
