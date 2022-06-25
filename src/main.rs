@@ -164,7 +164,7 @@ async fn query_channel(channel_id: String, async_state: Arc<Mutex<YTClientConfig
     let res = async_state.lock().await.http_client.get(uri).send().await;
     match res {
         Ok(res) => {
-            extract_xml(&res.text().await.unwrap()).get(0).unwrap();
+            return extract_xml(&res.text().await.unwrap()).get(0).unwrap().clone();
             // for now just take the first but should be changed to check if it contains current video_id if not return all ids or ids up to current video_id
         }
         Err(e) => tracing::event!(target:"yt", Level::ERROR, "{}", e.to_string()),
@@ -189,8 +189,8 @@ fn extract_xml(xml: &String) -> Vec<String> {
                         .read_text(b"yt:videoId", &mut Vec::new())
                         .expect("Cannot decode text value"),
                 );
-                println!("{:?}", txt);
             }
+            Ok(Event::Eof) => break, // exits the loop when reaching end of file
             Err(e) => panic!("Error at position {}: {:?}", reader.buffer_position(), e),
             _ => (), // There are several other `Event`s we do not consider here
         }
@@ -323,8 +323,8 @@ impl Database {
             channel_id,
             title: vid_player.video_details.title,
             likes: get_likes(&vid_next),
-            view_count: vid_player.video_details.view_count.parse().unwrap(),
-            length_in_seconds: vid_player.video_details.length_seconds.parse().unwrap(),
+            view_count: vid_player.video_details.view_count,
+            length_in_seconds: vid_player.video_details.length_seconds,
             description: get_description(&vid_next),
             genre: vid_player.microformat.player_microformat_renderer.category,
             genre_url: String::from(""),
@@ -376,8 +376,8 @@ pub struct Video {
     pub channel_id: String,
     pub title: String,
     pub likes: String,
-    pub view_count: i64,
-    pub length_in_seconds: i64,
+    pub view_count: String,
+    pub length_in_seconds: String,
     pub description: String,
     pub genre: String,
     pub genre_url: String,
