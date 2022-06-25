@@ -1,6 +1,6 @@
 use axum::{extract::Extension, http::StatusCode, routing::post, Json, Router};
 use chrono::Duration;
-use rdkafka::{ClientConfig, producer};
+use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use scylla::transport::errors::NewSessionError;
 use scylla::{Session, SessionBuilder};
@@ -10,7 +10,6 @@ use tokio::join;
 use tracing::Level;
 use tracing_subscriber::registry::Data;
 use youtubei_rs::query::{next_video_id, player};
-use youtubei_rs::types::error::RequestError;
 use youtubei_rs::types::query_results::NextResult;
 use std::borrow::Cow;
 use std::fmt::Debug;
@@ -22,9 +21,7 @@ use std::{
 };
 use tokio::runtime::Handle;
 
-use youtubei_rs::{
-    query::browse_id, types::misc::TabRendererContent, utils::default_client_config,
-};
+use youtubei_rs::utils::default_client_config;
 
 #[tokio::main]
 async fn main() {
@@ -138,30 +135,7 @@ fn executer_thread(
 }
 async fn query_channel(channel_id: String) -> String {
     println!("updated {}", channel_id);
-    let browse_data = browse_id(channel_id, "".to_string(), &default_client_config()).await;
-    match browse_data {
-        Ok(data) => match data.contents.unwrap().two_column_browse_results_renderer.unwrap().tabs.get(0).unwrap().tab_renderer.as_ref().unwrap().content.as_ref().unwrap(){
-            TabRendererContent::SectionListRenderer(content) => for item in content.contents.iter(){
-                match item{
-                    youtubei_rs::types::misc::ItemSectionRendererContents::ItemSectionRenderer(item) => for item in item.contents.iter() {
-                        match item {
-                            youtubei_rs::types::misc::ItemSectionRendererContents::ShelfRenderer(shelf) => 
-                            match shelf.title.runs.as_ref().unwrap().get(0).unwrap().text.as_str(){
-                                "Uploads"=> return get_video_from_shelf(shelf),
-                                "latest and greatest" => return get_video_from_shelf(shelf),
-                                _ => continue,
-                            },
-                            _ => continue,
-                        };
-                    },
-                    _ => unreachable!(),
-                };
-            }
-            _ => unreachable!()
-        },
-        Err(_) => return String::from(""),
-    };
-    return String::from("")
+    
 }
 
 fn get_video_from_shelf(shelf: &youtubei_rs::types::misc::ShelfRenderer) -> String {
