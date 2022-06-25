@@ -20,8 +20,10 @@ use std::{
     thread, time,
 };
 use tokio::runtime::Handle;
-
-use youtubei_rs::utils::default_client_config;
+use tokio::sync::Mutex;
+use quick_xml::Reader;
+use quick_xml::events::Event;
+use youtubei_rs::{utils::default_client_config, types::client::ClientConfig as YTClientConfig};
 
 #[tokio::main]
 async fn main() {
@@ -32,29 +34,30 @@ async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
     let tk_rt_handle: Arc<RwLock<Handle>> = Arc::new(RwLock::new(Handle::current()));
-    let state = Arc::new(RwLock::new(State {
+    let syncstate = Arc::new(RwLock::new(State {
         channels_video_ids: HashMap::new(),
         channels_to_refresh: Vec::new(),
         current_channel_stack: Vec::new(),
     }));
+    let asyncstate = Arc::new(Mutex::new(default_client_config()));
     let (sender, receiver) = mpsc::channel::<String>();
     let handle_fill = {
-        let state = state.clone();
+        let state = syncstate.clone();
         thread::spawn(move || {
             fill_stack(state);
         })
     };
     let db = Database::new("192.168.100.100:19042", None).await.unwrap();
     let handle_exec = {
-        let state = state.clone();
+        let state = syncstate.clone();
         thread::spawn(move || {
-            executer_thread(state, tk_rt_handle, receiver,Arc::new(producer), Arc::new(db));
+            executer_thread(state, tk_rt_handle, receiver,Arc::new(producer), Arc::new(db),asyncstate);
         })
     };
     let app = Router::new()
         .route("/add_channel", post(add_channel))
         .route("/remove_channel", post(remove_channel))
-        .layer(Extension(state));
+        .layer(Extension(syncstate));
     let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
 
     tracing::debug!("listening on {}", addr);
@@ -91,7 +94,8 @@ fn executer_thread(
     handle: Arc<RwLock<Handle>>,
     rx: mpsc::Receiver<String>,
     kafka_producer: Arc<FutureProducer>,
-    db_manager: Arc<Database>
+    db_manager: Arc<Database>,
+    async_state: Arc<Mutex<YTClientConfig>>,
 ) {
     loop {
         let mut lock = state.write().unwrap();
@@ -100,8 +104,9 @@ fn executer_thread(
                 let s = state.clone();
                 let kafka_producer = kafka_producer.clone();
                 let db_manager = db_manager.clone();
+                let async_state = async_state.clone();
                 Some(handle.read().unwrap().spawn(async move {
-                    let vid = query_channel(cid.clone()).await;
+                    let vid = query_channel(cid.clone(), async_state).await;
                     if !vid.is_empty() && s.read().unwrap().channels_video_ids.get(&cid).unwrap() != &vid {
                         println!("New video {}", vid);
                         s.write().unwrap().channels_video_ids.insert(cid.clone(), vid.clone());
@@ -133,9 +138,47 @@ fn executer_thread(
     }
     return;
 }
-async fn query_channel(channel_id: String) -> String {
+async fn query_channel(channel_id: String, async_state: Arc<Mutex<YTClientConfig>>) -> String {
     println!("updated {}", channel_id);
+    let uri = format!("https://www.youtube.com/feeds/videos.xml?channel_id={}", channel_id);
+    let res = async_state.lock().await.http_client.get(uri).send().await;
+    match res {
+        Ok(res) => {
+            extract_xml(&res.text().await.unwrap()).get(0).unwrap();
+            // for now just take the first but should be changed to check if it contains current video_id if not return all ids or ids up to current video_id
+        },
+        Err(e) => tracing::event!(target:"yt", Level::ERROR, "{}", e.to_string()),
+    };
+    todo!()
+}
+
+fn extract_xml(xml: &String) -> Vec<String>{
+    let mut reader = Reader::from_str(xml);
+    reader.trim_text(true);
+    let mut buf = Vec::new();
+    let mut txt = Vec::new();
+    // The `Reader` does not implement `Iterator` because it outputs borrowed data (`Cow`s)
+    loop {
+        match reader.read_event(&mut buf) {
+        // for triggering namespaced events, use this instead:
+        // match reader.read_namespaced_event(&mut buf) {
+            // unescape and decode the text event using the reader encoding
+            Ok(Event::Start(ref e)) if e.name().as_ref() == b"yt:videoId" => {
+                txt.push(
+                    reader
+                        .read_text(b"yt:videoId", &mut Vec::new())
+                        .expect("Cannot decode text value"),
+                );
+                println!("{:?}", txt);
+            }
+            Err(e) => panic!("Error at position {}: {:?}", reader.buffer_position(), e),
+            _ => (), // There are several other `Event`s we do not consider here
+        }
     
+        // if we don't keep a borrow elsewhere, we can clear the buffer to keep memory usage low
+        buf.clear();
+    }
+    txt
 }
 
 fn get_video_from_shelf(shelf: &youtubei_rs::types::misc::ShelfRenderer) -> String {
