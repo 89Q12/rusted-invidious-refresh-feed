@@ -1,29 +1,32 @@
 use axum::{extract::Extension, http::StatusCode, routing::post, Json, Router};
 use chrono::Duration;
-use quick_xml::events::Event;
-use quick_xml::Reader;
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::ClientConfig;
-use scylla::prepared_statement::PreparedStatement;
-use scylla::transport::errors::NewSessionError;
-use scylla::{Session, SessionBuilder};
+use quick_xml::{events::Event, Reader};
+use rdkafka::{
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig,
+};
+use scylla::{
+    prepared_statement::PreparedStatement, transport::errors::NewSessionError, Session,
+    SessionBuilder,
+};
 use serde::Deserialize;
-use std::borrow::Cow;
-use std::fmt::Debug;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{collections::HashMap, net::SocketAddr};
 use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt::Debug,
+    net::SocketAddr,
     sync::{mpsc, Arc, RwLock},
     thread, time,
+    time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::join;
-use tokio::runtime::Handle;
-use tokio::sync::Mutex;
+use tokio::{join, runtime::Handle, sync::Mutex};
 use tracing::Level;
 use tracing_subscriber::registry::Data;
-use youtubei_rs::query::{next_video_id, player};
-use youtubei_rs::types::query_results::NextResult;
-use youtubei_rs::{types::client::ClientConfig as YTClientConfig, utils::default_client_config};
+use youtubei_rs::{
+    query::{next_video_id, player},
+    types::{client::ClientConfig as YTClientConfig, query_results::NextResult},
+    utils::default_client_config,
+};
 
 #[tokio::main]
 async fn main() {
