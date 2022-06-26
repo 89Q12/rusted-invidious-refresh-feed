@@ -127,7 +127,7 @@ fn executer_thread(
                             .channels_video_ids
                             .insert(cid.clone(), vid.clone());
                         let dbcall = db_manager.fetch_and_insert(vid.clone(), cid.clone());
-                        let payload = format!(r#"{{"channel_id"={}, "video_id={} }}"#, &cid, &vid);
+                        let payload = format!(r#"{{"channel_id":"{}", "video_id":"{}" }}"#, &cid, &vid);
                         // TODO: Notify the notification manager about the new video
                         let kafkacall = kafka_producer.send(
                             FutureRecord::to("video_feed").payload(&payload).key(""),
