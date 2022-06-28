@@ -21,7 +21,6 @@ use std::{
 };
 use tokio::{join, runtime::Handle, sync::Mutex};
 use tracing::Level;
-use tracing_subscriber::registry::Data;
 use youtubei_rs::{
     query::{next_video_id, player},
     types::{client::ClientConfig as YTClientConfig, query_results::NextResult},
