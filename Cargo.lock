@@ -1013,6 +1013,7 @@ dependencies = [
  "chrono",
  "quick-xml",
  "rdkafka",
+ "rusted-invidious-types",
  "scylla",
  "serde",
  "serde_json",
@@ -1020,6 +1021,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "youtubei-rs",
+]
+
+[[package]]
+name = "rusted-invidious-types"
+version = "0.1.1"
+source = "git+https://github.com/11Tuvork28/rusted-invidious-shared.git#b5716d90058c9b6cc98965a70d581b11dcaec0f6"
+dependencies = [
+ "chrono",
+ "scylla",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

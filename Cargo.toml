@@ -17,3 +17,4 @@ rdkafka  = "0.28"
 scylla = "0.4"
 chrono= "0.4"
 quick-xml = "0.23.0"
+rusted-invidious-types = { git = "https://github.com/11Tuvork28/rusted-invidious-shared.git", version= "0.1.1"}
