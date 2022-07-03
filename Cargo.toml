@@ -1,5 +1,5 @@
 [package]
-name = "rusted-job-management"
+name = "rusted-invidious-refresh-feed"
 version = "0.1.0"
 edition = "2021"
 
