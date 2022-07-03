@@ -5,15 +5,12 @@ use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     ClientConfig,
 };
-use scylla::{
-    prepared_statement::PreparedStatement, transport::errors::NewSessionError, Session,
-    SessionBuilder,
-};
+
+use rusted_invidious_types::database::{db_manager::DbManager, models::video::Video};
+use scylla::frame::value::Timestamp;
 use serde::Deserialize;
 use std::{
-    borrow::Cow,
     collections::HashMap,
-    fmt::Debug,
     net::SocketAddr,
     sync::{mpsc, Arc, RwLock},
     thread, time,
@@ -50,7 +47,7 @@ async fn main() {
             fill_stack(state);
         })
     };
-    let db = Database::new("192.168.100.100:19042", None).await.unwrap();
+    let db = DbManager::new("192.168.100.100:19042", None).await.unwrap();
     let handle_exec = {
         let state = syncstate.clone();
         thread::spawn(move || {
@@ -104,7 +101,7 @@ fn executer_thread(
     handle: Arc<RwLock<Handle>>,
     rx: mpsc::Receiver<String>,
     kafka_producer: Arc<FutureProducer>,
-    db_manager: Arc<Database>,
+    db_manager: Arc<DbManager>,
     async_state: Arc<Mutex<YTClientConfig>>,
 ) {
     loop {
@@ -125,14 +122,17 @@ fn executer_thread(
                             .unwrap()
                             .channels_video_ids
                             .insert(cid.clone(), vid.clone());
-                        let dbcall = db_manager.fetch_and_insert(vid.clone(), cid.clone());
-                        let payload = format!(r#"{{"channel_id":"{}", "video_id":"{}" }}"#, &cid, &vid);
+                        let dbcall = fetch_video(vid.clone(), cid.clone());
+                        let payload =
+                            format!(r#"{{"channel_id":"{}", "video_id":"{}" }}"#, &cid, &vid);
                         // TODO: Notify the notification manager about the new video
                         let kafkacall = kafka_producer.send(
                             FutureRecord::to("video_feed").payload(&payload).key(""),
                             std::time::Duration::from_secs(0),
                         );
-                        join!(kafkacall, dbcall).0.unwrap(); // TODO: Add tracing here to track errors
+                        let (reskafka, video) = join!(kafkacall, dbcall); // TODO: Add tracing here to track errors
+                        reskafka.unwrap();
+                        db_manager.insert_video(video).await;
                         return;
                     }
                     println!("No new video: {}", vid);
@@ -163,7 +163,10 @@ async fn query_channel(channel_id: String, async_state: Arc<Mutex<YTClientConfig
     let res = async_state.lock().await.http_client.get(uri).send().await;
     match res {
         Ok(res) => {
-            return extract_xml(&res.text().await.unwrap()).get(0).unwrap().clone();
+            return extract_xml(&res.text().await.unwrap())
+                .get(0)
+                .unwrap()
+                .clone();
             // for now just take the first but should be changed to check if it contains current video_id if not return all ids or ids up to current video_id
         }
         Err(e) => tracing::event!(target:"yt", Level::ERROR, "{}", e.to_string()),
@@ -267,159 +270,52 @@ struct State {
     current_channel_stack: Vec<String>,
 }
 
-struct Database {
-    session: Session,
-    prepared_statement: PreparedStatement,
-}
-impl Database {
-    /// Initializes a new DbManager struct and creates the database session
-    async fn new(uri: &str, known_hosts: Option<Vec<String>>) -> Result<Self, NewSessionError> {
-        let session_builder;
-        if known_hosts.is_some() {
-            session_builder = SessionBuilder::new()
-                .known_node(uri)
-                .known_nodes(&known_hosts.unwrap());
-        } else {
-            session_builder = SessionBuilder::new().known_node(uri);
-        }
-
-        match session_builder.build().await {
-            Ok(session) => {
-                match session.use_keyspace("rusted_invidious", false).await {
-                    Ok(_) => {
-                        tracing::event!(target:"db", Level::DEBUG, "Successfully set keyspace")
-                    }
-                    Err(_) => panic!("KESPACE NOT FOUND EXISTING...."),
-                }
-                let prepared_statement = session.prepare("INSERT INTO videos (video_id, updated_at, channel_id, title, likes, view_count,\
-                    description, length_in_seconds, genere, genre_url, license, author_verified, subcriber_count, author_name, author_thumbnail_url, is_famliy_safe, publish_date, formats, storyboard_spec_url, continuation_related, continuation_comments ) \
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").await.unwrap();
-                Ok(Self {
-                    session,
-                    prepared_statement,
-                })
-            }
-            Err(err) => Err(err),
-        }
-    }
-    async fn fetch_and_insert(&self, video_id: String, channel_id: String) {
-        let client = default_client_config();
-        let next = next_video_id(video_id.clone(), "".to_string(), &client);
-        let player = player(video_id.clone(), "".to_string(), &client);
-        let (vid_next, vid_player) = join!(next, player);
-        let vid_next = vid_next.unwrap();
-        let vid_player = vid_player.unwrap();
-        let video = Video {
-            video_id,
-            updated_at: Timestamp(Duration::seconds(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    .try_into()
-                    .unwrap(),
-            )),
-            channel_id,
-            title: vid_player.video_details.title,
-            likes: get_likes(&vid_next),
-            view_count: vid_player.video_details.view_count,
-            length_in_seconds: vid_player.video_details.length_seconds,
-            description: get_description(&vid_next),
-            genre: vid_player.microformat.player_microformat_renderer.category,
-            genre_url: String::from(""),
-            license: String::from(""),
-            author_verified: get_author_verified(&vid_next),
-            subcriber_count: get_subcribe_count(&vid_next),
-            author_name: vid_player.video_details.author,
-            author_thumbnail_url: get_owner_thumbnail(&vid_next),
-            is_famliy_safe: vid_player
-                .microformat
-                .player_microformat_renderer
-                .is_family_safe,
-            publish_date: vid_player
-                .microformat
-                .player_microformat_renderer
-                .publish_date,
-            formats: String::from(""),
-            storyboard_spec_url: vid_player.storyboards.player_storyboard_spec_renderer.spec,
-            continuation_comments: get_continuation_comments(&vid_next),
-            continuation_related: get_continuation_related(&vid_next),
-        };
-        print!("{}", video.title);
-        let res = self.insert_video(video).await;
-        if !res {
-            panic!("Failed to insert video: {}", res);
-        }
-    }
-    pub async fn insert_video(&self, video: Video) -> bool {
-        match self.session.execute(&self.prepared_statement, video).await {
-            Ok(_) => true,
-            Err(e) => {
-                println!("Failed to insert video: {}", e);
-                false
-            }
-        }
-    }
+async fn fetch_video(video_id: String, channel_id: String) -> Video {
+    let client = default_client_config();
+    let next = next_video_id(video_id.clone(), "".to_string(), &client);
+    let player = player(video_id.clone(), "".to_string(), &client);
+    let (vid_next, vid_player) = join!(next, player);
+    let vid_next = vid_next.unwrap();
+    let vid_player = vid_player.unwrap();
+    let video = Video {
+        video_id,
+        updated_at: Timestamp(Duration::seconds(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .try_into()
+                .unwrap(),
+        )),
+        channel_id,
+        title: vid_player.video_details.title,
+        likes: get_likes(&vid_next),
+        view_count: vid_player.video_details.view_count.parse().unwrap(),
+        length_in_seconds: vid_player.video_details.length_seconds.parse().unwrap(),
+        description: get_description(&vid_next),
+        genre: vid_player.microformat.player_microformat_renderer.category,
+        genre_url: String::from(""),
+        license: String::from(""),
+        author_verified: get_author_verified(&vid_next),
+        subcriber_count: get_subcribe_count(&vid_next),
+        author_name: vid_player.video_details.author,
+        author_thumbnail_url: get_owner_thumbnail(&vid_next),
+        is_famliy_safe: vid_player
+            .microformat
+            .player_microformat_renderer
+            .is_family_safe,
+        publish_date: vid_player
+            .microformat
+            .player_microformat_renderer
+            .publish_date,
+        formats: String::from(""),
+        storyboard_spec_url: vid_player.storyboards.player_storyboard_spec_renderer.spec,
+        continuation_comments: get_continuation_comments(&vid_next),
+        continuation_related: get_continuation_related(&vid_next),
+    };
+    video
 }
 
-use scylla::cql_to_rust::FromCqlVal;
-use scylla::frame::value::{SerializedResult, SerializedValues, Timestamp, ValueList};
-use scylla::macros::{FromRow, FromUserType, IntoUserType};
-
-/// Temporary needs to be in serpart crate aka rusted-invidious-types
-/// Represents a video queried from the database
-#[derive(Debug, IntoUserType, FromUserType, FromRow)]
-pub struct Video {
-    pub video_id: String, // Primary Key -> partition key
-    pub updated_at: Timestamp,
-    pub channel_id: String,
-    pub title: String,
-    pub likes: String,
-    pub view_count: String,
-    pub length_in_seconds: String,
-    pub description: String,
-    pub genre: String,
-    pub genre_url: String,
-    pub license: String,
-    pub author_verified: bool,
-    pub subcriber_count: String,
-    pub author_name: String,
-    pub author_thumbnail_url: String,
-    pub is_famliy_safe: bool,
-    pub publish_date: String,
-    pub formats: String, // This string contains json that holds all formats for the video. Could be stored in own table I think
-    pub storyboard_spec_url: String,
-    pub continuation_comments: Option<String>,
-    pub continuation_related: Option<String>,
-}
-impl ValueList for Video {
-    fn serialized(&self) -> SerializedResult {
-        let mut result = SerializedValues::with_capacity(2);
-        result.add_value(&self.video_id)?;
-        result.add_value(&self.updated_at)?;
-        result.add_value(&self.channel_id)?;
-        result.add_value(&self.title)?;
-        result.add_value(&self.likes)?;
-        result.add_value(&self.view_count)?;
-        result.add_value(&self.length_in_seconds)?;
-        result.add_value(&self.description)?;
-        result.add_value(&self.genre)?;
-        result.add_value(&self.genre_url)?;
-        result.add_value(&self.license)?;
-        result.add_value(&self.author_verified)?;
-        result.add_value(&self.subcriber_count)?;
-        result.add_value(&self.author_name)?;
-        result.add_value(&self.author_thumbnail_url)?;
-        result.add_value(&self.is_famliy_safe)?;
-        result.add_value(&self.publish_date)?;
-        result.add_value(&self.formats)?;
-        result.add_value(&self.storyboard_spec_url)?;
-        result.add_value(&self.continuation_comments)?;
-        result.add_value(&self.continuation_related)?;
-
-        Ok(Cow::Owned(result))
-    }
-}
 fn get_likes(video: &NextResult) -> String {
     match video
         .contents
