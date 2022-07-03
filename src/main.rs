@@ -203,27 +203,6 @@ fn extract_xml(xml: &String) -> Vec<String> {
     txt
 }
 
-fn get_video_from_shelf(shelf: &youtubei_rs::types::misc::ShelfRenderer) -> String {
-    println!(
-        "{}",
-        shelf.title.runs.as_ref().unwrap().get(0).unwrap().text
-    );
-    match shelf
-        .content
-        .horizontal_list_renderer
-        .as_ref()
-        .unwrap()
-        .items
-        .get(0)
-        .unwrap()
-    {
-        youtubei_rs::types::misc::ItemSectionRendererContents::GridVideoRenderer(vid) => {
-            return vid.video_id.clone()
-        }
-        _ => return String::from(""),
-    };
-}
-
 async fn add_channel(
     Json(payload): Json<Channel>,
     Extension(state): Extension<Arc<RwLock<State>>>,
